@@ -48,7 +48,7 @@ async function newPage(viewport = { width: 420, height: 860 }) {
 }
 
 // 2) Live mode with mocked Supabase functions (no real keys)
-async function liveCtx(roastHandler) {
+async function liveCtx(roastHandler, speakHandler = null) {
   const t = await newPage();
   await t.page.route("**/config.js", (r) => r.fulfill({ contentType: "text/javascript",
     body: 'window.JERK_CONFIG={supabaseUrl:"https://fake.supabase.co",supabaseAnonKey:"anon"};' }));
@@ -57,6 +57,7 @@ async function liveCtx(roastHandler) {
     const fn = r.request().url().split("/").pop();
     seen[fn] = JSON.parse(r.request().postData() || "{}");
     if (fn === "roast") return roastHandler(r);
+    if (speakHandler) return speakHandler(r);
     return r.fulfill({ status: 503, contentType: "application/json", headers: { "Access-Control-Allow-Origin": "*" }, body: '{"configured":false}' });
   });
   return { ...t, seen };
@@ -65,7 +66,7 @@ async function liveCtx(roastHandler) {
   const { ctx, page, errors, seen } = await liveCtx((r) => r.fulfill({ status: 200, contentType: "application/json",
     headers: { "Access-Control-Allow-Origin": "*" }, body: JSON.stringify({ reply: "LIVE: nice try, kid." }) }));
   await page.goto(URL);
-  ok("live badge", (await page.textContent("#modeBadge")).startsWith("LIVE AI"));
+  ok("live badge says LIVE AI only (voice not proven yet)", (await page.textContent("#modeBadge")) === "LIVE AI");
   ok("live banner hidden", !(await page.isVisible("#demoBanner")));
   await page.fill("#input", "hello");
   await page.click("#sendBtn");
@@ -75,12 +76,29 @@ async function liveCtx(roastHandler) {
   ok("live reply not tagged demo", (await last.getAttribute("data-demo")) === null);
   await page.waitForTimeout(800);
   ok("speak called, 503 -> browser voice", seen.speak?.text === "LIVE: nice try, kid." &&
-     (await page.evaluate(() => window.__jerk.state.cloudVoice)) === false);
+     (await page.evaluate(() => window.__jerk.state.voice)) === "browser");
+  ok("badge still LIVE AI after speak 503", (await page.textContent("#modeBadge")) === "LIVE AI");
   await page.fill("#input", "round two");
   await page.click("#sendBtn");
   await page.waitForFunction(() => document.querySelectorAll(".msg.jimmy").length >= 3);
   ok("history sent on 2nd turn", seen.roast?.history?.length === 2, JSON.stringify(seen.roast?.history));
   ok("no JS errors (live)", errors.length === 0, errors.join(" | "));
+  await ctx.close();
+}
+// 2b) speak really returns audio -> only then claim Jimmy's voice
+{
+  const { ctx, page } = await liveCtx(
+    (r) => r.fulfill({ status: 200, contentType: "application/json",
+      headers: { "Access-Control-Allow-Origin": "*" }, body: JSON.stringify({ reply: "voiced roast" }) }),
+    (r) => r.fulfill({ status: 200, contentType: "audio/mpeg",
+      headers: { "Access-Control-Allow-Origin": "*" }, body: Buffer.from([0xff, 0xfb, 0x90, 0x00]) }),
+  );
+  await page.goto(URL);
+  ok("voice badge hidden before speak works", (await page.textContent("#modeBadge")) === "LIVE AI");
+  await page.fill("#input", "hello");
+  await page.click("#sendBtn");
+  await page.waitForFunction(() => document.getElementById("modeBadge").textContent.includes("Jimmy's voice"), null, { timeout: 5000 }).catch(() => {});
+  ok("speak audio -> LIVE AI + Jimmy's voice", (await page.textContent("#modeBadge")) === "LIVE AI + Jimmy's voice");
   await ctx.close();
 }
 // 3) Backend up but no AI key -> switches to demo

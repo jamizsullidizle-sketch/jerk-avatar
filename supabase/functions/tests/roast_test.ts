@@ -2,6 +2,7 @@
 // Spins up a fake Gemini / OpenAI server on localhost and checks the exact request roast sends.
 import {
   DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_MODELS,
   handler,
   rateLimited,
   resetRateLimit,
@@ -21,6 +22,8 @@ function assertEquals(a: unknown, b: unknown, msg = "") {
 const ENV_KEYS = [
   "GEMINI_API_KEY",
   "GEMINI_MODEL",
+  "GEMINI_MODELS",
+  "GEMINI_BUDGET_MS",
   "GEMINI_BASE_URL",
   "GEMINI_THINKING_LEVEL",
   "OPENAI_API_KEY",
@@ -31,6 +34,7 @@ const ENV_KEYS = [
 function setEnv(vars: Record<string, string>) {
   for (const k of ENV_KEYS) Deno.env.delete(k);
   for (const [k, v] of Object.entries(vars)) Deno.env.set(k, v);
+  resetRateLimit(); // every handler() call in these tests comes from the same "unknown" IP
 }
 
 interface Captured {
@@ -44,7 +48,7 @@ interface Captured {
 
 /** Fake upstream that records each request and answers like Gemini or OpenAI. */
 function fakeServer(
-  respond: (c: Captured) => Response,
+  respond: (c: Captured) => Response | Promise<Response>,
 ): { url: string; calls: Captured[]; close: () => Promise<void> } {
   const calls: Captured[] = [];
   const ac = new AbortController();
@@ -235,6 +239,11 @@ Deno.test("Gemini upstream error -> 502, blocked prompt -> 502", async () => {
     let res = await handler(roastReq({ message: "x" }));
     assertEquals(res.status, 502);
     await res.json();
+    assertEquals(
+      fake.calls.length,
+      DEFAULT_GEMINI_MODELS.length,
+      "429 walks the whole chain",
+    );
     mode = "blocked";
     res = await handler(roastReq({ message: "x" }));
     assertEquals(res.status, 502);
@@ -338,4 +347,176 @@ Deno.test("rate limit window expires", () => {
   );
   assertEquals(rateLimited("9.9.9.9", t0 + 600_001), 0, "allowed after window");
   resetRateLimit();
+});
+
+const modelOf = (c: Captured) =>
+  c.path.replace(/^.*\/models\//, "").replace(/:generateContent$/, "");
+
+Deno.test("model chain: default order starts with flash-lite, ends with gemma", () => {
+  assertEquals(DEFAULT_GEMINI_MODELS, [
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemma-4-31b-it",
+  ]);
+  assertEquals(DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_MODELS[0]);
+});
+
+Deno.test("model chain: 503 then 429 then 500 -> falls through to the model that answers", async () => {
+  const fake = fakeServer((c) => {
+    const m = modelOf(c);
+    if (m === "a-busy") {
+      return new Response('{"error":{"code":503}}', { status: 503 });
+    }
+    if (m === "b-limited") return new Response("{}", { status: 429 });
+    if (m === "c-broken") return new Response("{}", { status: 500 });
+    return geminiOk("finally, a model with a pulse");
+  });
+  try {
+    setEnv({
+      GEMINI_API_KEY: "k",
+      GEMINI_BASE_URL: `${fake.url}/v1beta`,
+      GEMINI_MODELS: " a-busy, b-limited ,c-broken,d-ok,e-never ",
+    });
+    const res = await handler(roastReq({ message: "yo" }));
+    const data = await res.json();
+    assertEquals(res.status, 200, JSON.stringify(data));
+    assertEquals(data.reply, "finally, a model with a pulse");
+    assertEquals(data.provider, "gemini");
+    assertEquals(data.model, "d-ok");
+    assertEquals(fake.calls.map(modelOf), [
+      "a-busy",
+      "b-limited",
+      "c-broken",
+      "d-ok",
+    ]);
+  } finally {
+    await fake.close();
+  }
+});
+
+Deno.test("model chain: 400/401/403 stop right away (another model won't fix a bad key)", async () => {
+  for (const status of [400, 401, 403]) {
+    const fake = fakeServer(() => new Response("{}", { status }));
+    try {
+      setEnv({
+        GEMINI_API_KEY: "k",
+        GEMINI_BASE_URL: `${fake.url}/v1beta`,
+        GEMINI_MODELS: "m1,m2,m3",
+      });
+      const res = await handler(roastReq({ message: "yo" }));
+      assertEquals(res.status, 502);
+      await res.json();
+      assertEquals(fake.calls.length, 1, `status ${status} should not retry`);
+    } finally {
+      await fake.close();
+    }
+  }
+});
+
+Deno.test("model chain: empty reply counts as a failure and moves on", async () => {
+  const fake = fakeServer((c) =>
+    modelOf(c) === "m1"
+      ? Response.json({
+        candidates: [{ content: { parts: [{ text: "hmm", thought: true }] } }],
+      })
+      : geminiOk("second model roast")
+  );
+  try {
+    setEnv({
+      GEMINI_API_KEY: "k",
+      GEMINI_BASE_URL: `${fake.url}/v1beta`,
+      GEMINI_MODELS: "m1,m2",
+    });
+    const res = await handler(roastReq({ message: "yo" }));
+    const data = await res.json();
+    assertEquals(data.model, "m2");
+    assertEquals(data.reply, "second model roast");
+  } finally {
+    await fake.close();
+  }
+});
+
+Deno.test("model chain: overall time budget stops a slow chain", async () => {
+  const fake = fakeServer(async (c) => {
+    if (modelOf(c) === "slow") await new Promise((r) => setTimeout(r, 600));
+    return geminiOk("too late");
+  });
+  try {
+    setEnv({
+      GEMINI_API_KEY: "k",
+      GEMINI_BASE_URL: `${fake.url}/v1beta`,
+      GEMINI_MODELS: "slow,fast",
+      GEMINI_BUDGET_MS: "700",
+    });
+    const t0 = Date.now();
+    const res = await handler(roastReq({ message: "yo" }));
+    const data = await res.json();
+    const took = Date.now() - t0;
+    // "slow" eats the budget (aborted at ~700 ms is fine too); "fast" never gets a turn
+    // unless at least 500 ms is left, so the whole thing must finish near the budget.
+    assert(took < 1500, `took ${took} ms`);
+    if (res.status === 200) assertEquals(data.model, "slow");
+    else assertEquals(res.status, 502);
+    assertEquals(fake.calls.map(modelOf).includes("fast"), false);
+  } finally {
+    await fake.close();
+  }
+});
+
+Deno.test("model chain: a hung model is aborted when the budget runs out", async () => {
+  const fake = fakeServer(async (c) => {
+    if (modelOf(c) === "hang") await new Promise((r) => setTimeout(r, 1500));
+    return geminiOk("fast model roast");
+  });
+  try {
+    setEnv({
+      GEMINI_API_KEY: "k",
+      GEMINI_BASE_URL: `${fake.url}/v1beta`,
+      GEMINI_MODELS: "hang,fast",
+      GEMINI_BUDGET_MS: "1000",
+    });
+    const res = await handler(roastReq({ message: "yo" }));
+    const data = await res.json();
+    // hang gets aborted when the 1 s budget is gone, so nothing is left for "fast".
+    assertEquals(res.status, 502, JSON.stringify(data));
+  } finally {
+    await fake.close();
+  }
+});
+
+Deno.test("gemma: persona folded into first user turn, no systemInstruction/thinkingConfig", async () => {
+  const fake = fakeServer(() => geminiOk("gemma roast"));
+  try {
+    setEnv({
+      GEMINI_API_KEY: "k",
+      GEMINI_BASE_URL: `${fake.url}/v1beta`,
+      GEMINI_MODELS: "gemma-4-31b-it",
+    });
+    const res = await handler(roastReq({
+      message: "now",
+      history: [{ role: "user", content: "first" }, {
+        role: "assistant",
+        content: "what",
+      }],
+    }));
+    const data = await res.json();
+    assertEquals(data.model, "gemma-4-31b-it");
+    const b = fake.calls[0].body;
+    assert(!("systemInstruction" in b), "no systemInstruction for gemma");
+    assert(
+      !("thinkingConfig" in b.generationConfig),
+      "no thinkingConfig for gemma",
+    );
+    assertEquals(b.contents.length, 3);
+    assertEquals(b.contents[0].role, "user");
+    assert(
+      b.contents[0].parts[0].text.startsWith(SYSTEM_PROMPT),
+      "persona first",
+    );
+    assert(b.contents[0].parts[0].text.endsWith("first"), "user text kept");
+    assertEquals(b.contents[2], { role: "user", parts: [{ text: "now" }] });
+  } finally {
+    await fake.close();
+  }
 });

@@ -65,7 +65,8 @@ These go on the **server** as Supabase secrets. Never put them in `config.js`.
 | Name | Needed? | What |
 |---|---|---|
 | `GEMINI_API_KEY` | **recommended (free)** | Google Gemini key from AI Studio |
-| `GEMINI_MODEL` | optional | Default `gemini-flash-latest` (current stable Flash, on the free tier). For a cheaper, faster model, try `gemini-3.5-flash-lite` |
+| `GEMINI_MODELS` | optional | Comma list of models tried in order. If one is overloaded or rate-limited (503/429/404/5xx) or times out, the next one gets a shot. Default: `gemini-flash-lite-latest,gemini-3.5-flash,gemini-flash-latest,gemma-4-31b-it`. Gemma gets the persona folded into the first message, since it has no system prompt or thinking settings. `GEMINI_MODEL` (one model) still works |
+| `GEMINI_BUDGET_MS` | optional | Total time for the whole model chain before giving up. Default 12000 |
 | `GEMINI_THINKING_LEVEL` | optional | `low` (default, quickest replies), `medium`, or `high` |
 | `GEMINI_BASE_URL` | optional | Default `https://generativelanguage.googleapis.com/v1beta` |
 | `OPENAI_API_KEY` | backup | OpenAI key (default model `gpt-4o-mini`). Only used if there's no Gemini key |

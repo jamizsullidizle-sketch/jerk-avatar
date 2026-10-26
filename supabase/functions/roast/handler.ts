@@ -2,7 +2,9 @@
 //
 // Takes { message, history } and returns { reply, provider }.
 // Provider priority (first key that is set wins):
-//   1. GEMINI_API_KEY  -> Google Gemini REST API (free tier)   model: GEMINI_MODEL   (default gemini-flash-latest)
+//   1. GEMINI_API_KEY  -> Google Gemini REST API (free tier)   models: GEMINI_MODELS (comma list, tried in order)
+//      Default chain: gemini-flash-lite-latest, gemini-3.5-flash, gemini-flash-latest, gemma-4-31b-it.
+//      On 429 / 404 / 5xx / timeout from one model, the next one is tried, within GEMINI_BUDGET_MS (default 12000).
 //   2. OPENAI_API_KEY  -> OpenAI-compatible chat API            model: LLM_MODEL      (default gpt-4o-mini)
 //   3. XAI_API_KEY     -> xAI (OpenAI-compatible)               model: LLM_MODEL      (default grok-3-mini)
 // Optional: GEMINI_BASE_URL, GEMINI_THINKING_LEVEL (low|medium|high, default low), LLM_BASE_URL.
@@ -18,7 +20,16 @@ export interface Turn {
 
 export const MAX_MESSAGE_CHARS = 500;
 export const MAX_HISTORY_TURNS = 10;
-export const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
+// Order picked from live tests (Oct 2026): flash-lite answers in ~1-2 s, 3.5-flash is slower,
+// gemini-flash-latest keeps returning 503 "high demand", gemma works but takes ~25 s.
+export const DEFAULT_GEMINI_MODELS = [
+  "gemini-flash-lite-latest",
+  "gemini-3.5-flash",
+  "gemini-flash-latest",
+  "gemma-4-31b-it",
+];
+export const DEFAULT_GEMINI_MODEL = DEFAULT_GEMINI_MODELS[0];
+export const DEFAULT_GEMINI_BUDGET_MS = 12_000;
 
 export const SYSTEM_PROMPT =
   `You are "Jimmy", the jerk avatar of Jimmy Sullivan: a cocky, loud, blue-collar welder from Warwick, Rhode Island.
@@ -44,6 +55,8 @@ export type Provider =
     apiKey: string;
     baseUrl: string;
     model: string;
+    models: string[];
+    budgetMs: number;
     thinkingLevel: string;
   }
   | { kind: "openai" | "xai"; apiKey: string; baseUrl: string; model: string };
@@ -55,6 +68,10 @@ export function pickProvider(): Provider | null {
   const gemini = env("GEMINI_API_KEY");
   if (gemini) {
     const lvl = env("GEMINI_THINKING_LEVEL").toLowerCase();
+    // GEMINI_MODELS (comma list) wins; GEMINI_MODEL (single) still works as a one-model chain.
+    const list = (env("GEMINI_MODELS") || env("GEMINI_MODEL"))
+      .split(",").map((m) => m.trim()).filter(Boolean);
+    const models = list.length ? list : [...DEFAULT_GEMINI_MODELS];
     return {
       kind: "gemini",
       apiKey: gemini,
@@ -62,7 +79,11 @@ export function pickProvider(): Provider | null {
         env("GEMINI_BASE_URL") ||
           "https://generativelanguage.googleapis.com/v1beta",
       ),
-      model: env("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
+      model: models[0],
+      models,
+      budgetMs: Number(env("GEMINI_BUDGET_MS")) > 0
+        ? Number(env("GEMINI_BUDGET_MS"))
+        : DEFAULT_GEMINI_BUDGET_MS,
       // "low" keeps replies fast for a voice chat. ("minimal" errors on 3.8 Flash.)
       thinkingLevel: ["low", "medium", "high"].includes(lvl) ? lvl : "low",
     };
@@ -108,16 +129,28 @@ export function cleanHistory(raw: unknown): Turn[] {
 }
 
 class ProviderError extends Error {
-  constructor(message: string, public status = 502) {
+  constructor(
+    message: string,
+    public status = 502,
+    public retryable = false,
+  ) {
     super(message);
   }
 }
+
+/** Gemma models on the Gemini API reject systemInstruction and thinkingConfig. */
+export const isGemma = (model: string) => /^gemma/i.test(model);
+
+/** Upstream statuses worth trying the next model for: rate limit, model gone, overload/5xx. */
+export const isRetryableStatus = (s: number) =>
+  s === 429 || s === 404 || s === 408 || s >= 500;
 
 // ---------- Gemini ----------
 export function buildGeminiBody(
   history: Turn[],
   message: string,
   thinkingLevel: string,
+  model = DEFAULT_GEMINI_MODEL,
 ) {
   // Gemini wants turns as user/model, starting with a user turn, and ending with the new user turn.
   const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
@@ -127,6 +160,14 @@ export function buildGeminiBody(
     const last = contents[contents.length - 1];
     if (last && last.role === role) last.parts[0].text += "\n" + t.content; // merge repeats
     else contents.push({ role, parts: [{ text: t.content }] });
+  }
+  if (isGemma(model)) {
+    // No system role or thinking config on Gemma: fold the persona into the first user turn.
+    contents[0].parts[0].text =
+      `${SYSTEM_PROMPT}\n\n---\nStay in character. The user says:\n${
+        contents[0].parts[0].text
+      }`;
+    return { contents, generationConfig: { maxOutputTokens: 1024 } };
   }
   return {
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
@@ -140,26 +181,49 @@ export function buildGeminiBody(
   };
 }
 
-async function callGemini(
+async function callGeminiModel(
   p: Extract<Provider, { kind: "gemini" }>,
+  model: string,
   history: Turn[],
   message: string,
+  signal: AbortSignal,
 ): Promise<string> {
   const url = `${p.baseUrl}/models/${
-    encodeURIComponent(p.model)
+    encodeURIComponent(model)
   }:generateContent`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "x-goog-api-key": p.apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify(buildGeminiBody(history, message, p.thinkingLevel)),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": p.apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(
+        buildGeminiBody(history, message, p.thinkingLevel, model),
+      ),
+      signal,
+    });
+  } catch (err) {
+    // Timeout (our budget ran out) or a network blip: let the chain move on.
+    throw new ProviderError(
+      `AI provider unreachable (${(err as Error)?.name ?? "error"})`,
+      502,
+      true,
+    );
+  }
   if (!res.ok) {
     console.error(
       "Gemini error",
+      model,
       res.status,
-      (await res.text()).slice(0, 500),
+      (await res.text()).slice(0, 300),
     );
-    throw new ProviderError(`AI provider error (${res.status})`);
+    throw new ProviderError(
+      `AI provider error (${res.status})`,
+      502,
+      isRetryableStatus(res.status),
+    );
   }
   const data = await res.json();
   if (data?.promptFeedback?.blockReason) {
@@ -167,11 +231,47 @@ async function callGemini(
   }
   const parts: { text?: string; thought?: boolean }[] =
     data?.candidates?.[0]?.content?.parts ?? [];
-  return parts
+  const text = parts
     .filter((x) => !x.thought && typeof x.text === "string")
     .map((x) => x.text)
     .join("")
     .trim();
+  if (!text) throw new ProviderError("Empty reply from AI", 502, true);
+  return text;
+}
+
+/** Try each model in the chain until one answers, inside one overall time budget. */
+export async function callGemini(
+  p: Extract<Provider, { kind: "gemini" }>,
+  history: Turn[],
+  message: string,
+): Promise<{ reply: string; model: string; tried: string[] }> {
+  const deadline = Date.now() + p.budgetMs;
+  const tried: string[] = [];
+  let lastErr: ProviderError | null = null;
+  for (const model of p.models) {
+    const left = deadline - Date.now();
+    if (left < 500) break; // not worth starting another call
+    tried.push(model);
+    try {
+      const reply = await callGeminiModel(
+        p,
+        model,
+        history,
+        message,
+        AbortSignal.timeout(left),
+      );
+      return { reply, model, tried };
+    } catch (err) {
+      lastErr = err instanceof ProviderError
+        ? err
+        : new ProviderError("AI provider error", 502, true);
+      if (!lastErr.retryable) break; // bad key / bad request: another model won't help
+    }
+  }
+  const e = lastErr ?? new ProviderError("AI provider timed out", 502);
+  e.message += ` after trying ${tried.join(", ") || "no models"}`;
+  throw e;
 }
 
 // ---------- OpenAI / xAI (OpenAI-compatible) ----------
@@ -287,11 +387,23 @@ export async function handler(req: Request): Promise<Response> {
   const history = cleanHistory(body.history);
 
   try {
-    const reply = provider.kind === "gemini"
-      ? await callGemini(provider, history, message)
-      : await callOpenAICompatible(provider, history, message);
+    if (provider.kind === "gemini") {
+      const r = await callGemini(provider, history, message);
+      return json({
+        reply: r.reply,
+        configured: true,
+        provider: "gemini",
+        model: r.model,
+      });
+    }
+    const reply = await callOpenAICompatible(provider, history, message);
     if (!reply) return json({ error: "Empty reply from AI" }, 502);
-    return json({ reply, configured: true, provider: provider.kind });
+    return json({
+      reply,
+      configured: true,
+      provider: provider.kind,
+      model: provider.model,
+    });
   } catch (err) {
     if (err instanceof ProviderError) {
       return json({ error: err.message }, err.status);

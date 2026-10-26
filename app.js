@@ -13,7 +13,9 @@
 
   const state = {
     demo: !backendConfigured, // flips to true if the backend says it has no AI key
-    cloudVoice: backendConfigured, // flips to false if the backend has no ElevenLabs key
+    // "unknown" until `speak` answers: "cloud" only after real Jimmy-voice audio comes back,
+    // "browser" once it says it isn't set up (503). The badge only claims Jimmy's voice for "cloud".
+    voice: backendConfigured ? "unknown" : "browser",
     history: [], // [{role, content}] real AI turns only
     busy: false,
     lastDemo: -1,
@@ -65,7 +67,9 @@
       statusTag.textContent = "Jimmy.Twin.Demo // scripted";
       demoBanner.hidden = false;
     } else {
-      badge.textContent = state.cloudVoice ? "LIVE AI + Jimmy's voice" : "LIVE AI";
+      const cloud = state.voice === "cloud";
+      badge.textContent = cloud ? "LIVE AI + Jimmy's voice" : "LIVE AI";
+      badge.title = cloud ? "AI replies, spoken in Jimmy's cloned voice" : "AI replies, spoken by your browser's built-in voice";
       badge.className = "badge live";
       statusTag.textContent = "Jimmy.Twin.Online // AI";
       demoBanner.hidden = true;
@@ -168,10 +172,15 @@
 
   async function speak(text) {
     stopSpeaking();
-    if (state.cloudVoice && !state.demo) {
+    if (state.voice !== "browser" && !state.demo) {
       try {
         const { res } = await callBackend("speak", { text }, true);
-        if (res.ok) {
+        const type = res.headers.get("content-type") || "";
+        if (res.ok && type.startsWith("audio")) {
+          if (state.voice !== "cloud") {
+            state.voice = "cloud";
+            renderMode();
+          }
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
           await playAudio(url);
@@ -179,9 +188,10 @@
           return;
         }
         if (res.status === 503) {
-          state.cloudVoice = false;
+          state.voice = "browser"; // no voice clone set up: stop asking, badge stays "LIVE AI"
           renderMode();
         }
+        if (!res.ok || !type.startsWith("audio")) await res.body?.cancel();
       } catch (err) {
         console.warn("speak failed, using browser voice", err);
       }

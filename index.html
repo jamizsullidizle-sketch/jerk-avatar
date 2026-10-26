@@ -33,13 +33,13 @@
         <span class="online"><i class="dot"></i><span id="statusTag">Jimmy.Twin.Online</span></span>
       </div>
       <div id="avatar" class="avatar" aria-hidden="true">
-        <div class="helmet"></div>
-        <div class="face">
-          <div class="brows"><span></span><span></span></div>
-          <div class="eyes"><span></span><span></span></div>
-          <div class="stubble"></div>
-          <div class="mouth"></div>
+        <div class="portrait">
+          <!-- Jimmy's photo, split at the mouth: the jaw layer drops a few px while he talks. -->
+          <img class="face-base" src="jimmy-base.webp" width="480" height="600" alt="" decoding="async">
+          <img id="jaw" class="face-jaw" src="jimmy-jaw.webp" width="191" height="119" alt="" decoding="async">
         </div>
+        <div class="rim"></div>
+        <div class="scan"></div>
       </div>
       <p id="status" class="status" aria-live="polite">Say something. I dare ya.</p>
     </section>

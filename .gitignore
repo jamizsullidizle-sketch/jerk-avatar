@@ -11,3 +11,12 @@
 # junk
 node_modules/
 .DS_Store
+# local verification artifacts (not part of the site)
+screenshot-live.png
+screenshot-avatar-*.png
+avatar-talking.gif
+avatar-talking.mp4
+# original full-size photos never go in the repo
+*.jpg
+*.jpeg
+*.heic

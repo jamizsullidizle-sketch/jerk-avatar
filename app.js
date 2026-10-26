@@ -116,6 +116,78 @@
   function setAvatar(mode) {
     avatar.classList.remove("talking", "thinking", "listening");
     if (mode) avatar.classList.add(mode);
+    if (mode === "talking") startMouth();
+    else mouth.talking = false; // the loop eases the jaw shut, then stops
+  }
+
+  // ---------- Mouth: drives --jaw (0 = shut, 1 = wide) on the photo's jaw layer ----------
+  // Sources, best first: real audio volume (WebAudio analyser on Jimmy's cloud voice),
+  // word-boundary kicks from speechSynthesis, and a randomized syllable flap as the fallback.
+  const mouth = { talking: false, level: 0, flap: 0, nextFlap: 0, kick: 0, analyser: null, buf: null, raf: 0 };
+  function startMouth() {
+    mouth.talking = true;
+    if (!mouth.raf) mouth.raf = requestAnimationFrame(mouthTick);
+  }
+  function mouthKick(amount = 1) {
+    mouth.kick = Math.max(mouth.kick, amount);
+  }
+  function mouthTick(t) {
+    let target = 0;
+    if (mouth.talking) {
+      if (mouth.analyser) {
+        mouth.analyser.getFloatTimeDomainData(mouth.buf);
+        let sum = 0;
+        for (const v of mouth.buf) sum += v * v;
+        const rms = Math.sqrt(sum / mouth.buf.length);
+        target = Math.min(1, Math.max(0, (rms - 0.015) * 7));
+      } else {
+        if (t >= mouth.nextFlap) {
+          const opening = mouth.flap < 0.3;
+          mouth.flap = opening ? 0.45 + Math.random() * 0.55 : Math.random() * 0.18;
+          // syllables ~6-9 per second, with the odd pause between words
+          mouth.nextFlap = t + (opening ? 70 + Math.random() * 80 : 45 + Math.random() * 70) +
+            (!opening && Math.random() < 0.12 ? 180 : 0);
+        }
+        target = mouth.flap;
+      }
+      target = Math.max(target, mouth.kick);
+      mouth.kick *= 0.82;
+    }
+    mouth.level += (target - mouth.level) * (target > mouth.level ? 0.55 : 0.35);
+    if (!mouth.talking && mouth.level < 0.01) mouth.level = 0;
+    avatar.style.setProperty("--jaw", mouth.level.toFixed(3));
+    mouth.raf = mouth.talking || mouth.level > 0 ? requestAnimationFrame(mouthTick) : 0;
+  }
+
+  let audioCtx = null;
+  // Called from the send gesture so the AudioContext is allowed to run later.
+  function primeAudio() {
+    if (state.voice === "browser" || state.demo) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = audioCtx || new AC();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    } catch { /* fine, the flap fallback still works */ }
+  }
+  function attachAnalyser(audioEl) {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = audioCtx || new AC();
+      // A suspended context would mute the audio routed through it; just flap instead.
+      if (audioCtx.state !== "running") return;
+      const src = audioCtx.createMediaElementSource(audioEl);
+      const an = audioCtx.createAnalyser();
+      an.fftSize = 1024;
+      src.connect(an);
+      an.connect(audioCtx.destination);
+      mouth.analyser = an;
+      mouth.buf = new Float32Array(an.fftSize);
+    } catch (err) {
+      console.warn("no audio analyser, using flap", err);
+      mouth.analyser = null;
+    }
   }
 
   function setBusy(b) {
@@ -203,12 +275,15 @@
     return new Promise((resolve) => {
       const a = new Audio(url);
       currentAudio = a;
+      attachAnalyser(a);
       a.onplay = () => setAvatar("talking");
       a.onended = a.onerror = () => {
+        mouth.analyser = null;
         setAvatar(null);
         resolve();
       };
       a.play().catch(() => {
+        mouth.analyser = null;
         setAvatar(null);
         resolve();
       });
@@ -244,6 +319,7 @@
       u.rate = 1.08;
       u.pitch = 0.8;
       u.onstart = () => setAvatar("talking");
+      u.onboundary = () => mouthKick(0.9); // word starts: pop the jaw open
       u.onend = u.onerror = () => {
         clearTimeout(safety);
         setAvatar(null);
@@ -263,6 +339,7 @@
     if (currentAudio) {
       currentAudio.pause();
       currentAudio = null;
+      mouth.analyser = null;
     }
     if ("speechSynthesis" in window) speechSynthesis.cancel();
     setAvatar(null);
@@ -273,6 +350,7 @@
     text = (text || "").trim();
     if (!text || state.busy) return;
     setBusy(true);
+    primeAudio();
     input.value = "";
     addMsg("you", text);
     setAvatar("thinking");
@@ -374,5 +452,5 @@
   if (backendConfigured) statusEl.textContent = "Connected. Say something. I dare ya.";
 
   // Expose a tiny hook for tests/debugging.
-  window.__jerk = { state, send };
+  window.__jerk = { state, send, setAvatar, mouth };
 })();

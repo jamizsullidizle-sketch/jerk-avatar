@@ -21,6 +21,7 @@ and no digging into anyone's private info. Replies stay at 1 to 3 sentences so t
 | File | What it does |
 |---|---|
 | `index.html`, `style.css`, `app.js` | The web page (avatar, chat log, mic, send) |
+| `jimmy-base.webp`, `jimmy-jaw.webp` | The talking photo avatar. The photo is split at the mouth line (found with face landmarks), and the jaw layer drops a few pixels while Jimmy talks. It's driven by the audio volume for Jimmy's cloud voice, by word boundaries for the browser voice, and by a random flap otherwise. Metadata is stripped |
 | `config.js` | Where you paste your Supabase URL and public anon key. Empty means demo mode |
 | `supabase/functions/roast/handler.ts` | AI brain: Jimmy persona prompt, Gemini / OpenAI / xAI calls |
 | `supabase/functions/roast/index.ts` | Starts the `roast` function |

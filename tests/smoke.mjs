@@ -47,6 +47,27 @@ async function newPage(viewport = { width: 420, height: 860 }) {
   await ctx.close();
 }
 
+// 1b) Photo avatar: both layers load, jaw opens while talking and shuts after
+{
+  const { ctx, page, errors } = await newPage({ width: 1200, height: 800 });
+  await page.goto(URL + "?demo=1");
+  await page.waitForFunction(() => [...document.querySelectorAll("#avatar img")].every((i) => i.complete && i.naturalWidth > 0));
+  const sizes = await page.evaluate(() => [...document.querySelectorAll("#avatar img")].map((i) => i.naturalWidth + "x" + i.naturalHeight));
+  ok("avatar photo layers loaded", sizes.join() === "480x600,191x119", sizes.join());
+  ok("jaw shut at idle", (await page.evaluate(() => getComputedStyle(document.getElementById("avatar")).getPropertyValue("--jaw").trim())) === "0");
+  await page.evaluate(() => window.__jerk.setAvatar("talking"));
+  let maxJaw = 0;
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(50);
+    maxJaw = Math.max(maxJaw, await page.evaluate(() => parseFloat(document.getElementById("avatar").style.getPropertyValue("--jaw")) || 0));
+  }
+  ok("jaw flaps while talking", maxJaw > 0.3, `max --jaw ${maxJaw}`);
+  await page.evaluate(() => window.__jerk.setAvatar(null));
+  await page.waitForTimeout(600);
+  ok("jaw shuts after talking", (await page.evaluate(() => parseFloat(document.getElementById("avatar").style.getPropertyValue("--jaw")) || 0)) === 0);
+  ok("no JS errors (avatar)", errors.length === 0, errors.join(" | "));
+  await ctx.close();
+}
 // 2) Live mode with mocked Supabase functions (no real keys)
 async function liveCtx(roastHandler, speakHandler = null) {
   const t = await newPage();

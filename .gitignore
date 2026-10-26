@@ -1,0 +1,13 @@
+# secrets: never commit
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.gemini_key
+**/.gemini_key
+*.key
+# junk
+node_modules/
+.DS_Store

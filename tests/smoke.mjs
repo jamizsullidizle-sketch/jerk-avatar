@@ -16,7 +16,7 @@ async function newPage(viewport = { width: 420, height: 860 }) {
 // 1) Offline demo mode
 {
   const { ctx, page, errors } = await newPage();
-  await page.goto(URL);
+  await page.goto(URL + "?demo=1");
   ok("demo badge", (await page.textContent("#modeBadge")) === "OFFLINE DEMO");
   ok("demo banner visible", await page.isVisible("#demoBanner"));
   await page.fill("#input", "Your welds look like bird droppings, Jimmy");
@@ -39,7 +39,7 @@ async function newPage(viewport = { width: 420, height: 860 }) {
 // 1b) Desktop screenshot
 {
   const { ctx, page } = await newPage({ width: 1200, height: 800 });
-  await page.goto(URL);
+  await page.goto(URL + "?demo=1");
   await page.fill("#input", "What's up loser");
   await page.click("#sendBtn");
   await page.waitForFunction(() => document.querySelectorAll(".msg.jimmy").length >= 2);
